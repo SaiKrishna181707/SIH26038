@@ -1,0 +1,9 @@
+backend/.venv/
+backend/__pycache__/
+backend/.pytest_cache/
+backend/.coverage
+backend/htmlcov/
+backend/**/*.py[cod]
+backend/.env
+backend/artifacts/
+
