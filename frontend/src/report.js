@@ -1,6 +1,5 @@
-// Client-side report generation. The backend stores nothing, so "Export" and
-// "Create referral" produce a downloadable record instead of pretending a
-// records system exists behind them.
+// Client-side report generation. The backend stores nothing, so exports produce
+// downloadable records in the browser.
 
 import { formatPercent, gradeInfo, isLowConfidence } from './severity.js';
 
@@ -21,10 +20,10 @@ function slug(patient) {
 }
 
 function timestampForFilename(isoTimestamp) {
-  return isoTimestamp.slice(0, 19).replace(/[:T]/g, '-');
+  const safe = typeof isoTimestamp === 'string' ? isoTimestamp : new Date().toISOString();
+  return safe.slice(0, 19).replace(/[:T]/g, '-');
 }
 
-/** Machine-readable record of one screening, including the full class distribution. */
 export function exportScreeningJson(screening) {
   const payload = {
     ...screening,
@@ -38,17 +37,18 @@ export function exportScreeningJson(screening) {
   );
 }
 
-/** Human-readable referral note for printing or attaching to a case file. */
+/** Human-readable screening/review note for printing or attaching to a case file. */
 export function exportReferralNote(screening) {
   const { patient, result, timestamp } = screening;
   const grade = gradeInfo(result.prediction);
+  const lowConfidence = isLowConfidence(result.confidence);
   const distribution = Object.entries(result.probabilities)
     .map(([name, value]) => `  ${name.padEnd(20)} ${formatPercent(value)}`)
     .join('\n');
 
   const lines = [
-    'RETINACARE AI — SCREENING REFERRAL NOTE',
-    '=======================================',
+    'RETINACARE AI — SCREENING REVIEW NOTE',
+    '======================================',
     '',
     `Generated:      ${new Date(timestamp).toLocaleString('en-IN')}`,
     `Patient ID:     ${patient.id || '(not recorded)'}`,
@@ -58,16 +58,17 @@ export function exportReferralNote(screening) {
     'AI SCREENING RESULT',
     `  Grade:        ${result.prediction}`,
     `  Confidence:   ${formatPercent(result.confidence)}`,
-    `  Referral:     ${grade.referral ? 'Recommended' : 'Not indicated by this screening'}`,
-    isLowConfidence(result.confidence)
-      ? '  Note:         Low confidence — manual review required.'
+    `  Referral:     ${grade.referral ? 'Recommended from predicted grade' : 'Not indicated by predicted grade'}`,
+    `  Manual review:${lowConfidence ? ' Required before triage/clearance' : ' Standard clinical review'}`,
+    lowConfidence && !grade.referral
+      ? '  Disposition:  Do not clear this screening from the AI result alone.'
       : null,
     '',
     'CLASS DISTRIBUTION',
     distribution,
     '',
     'GUIDANCE',
-    `  ${grade.guidance}`,
+    `  ${lowConfidence ? 'Low confidence — confirm the image manually before acting on the AI grade.' : grade.guidance}`,
     '',
     'IMPORTANT',
     '  Produced by an AI screening prototype that is not clinically validated.',
@@ -77,7 +78,7 @@ export function exportReferralNote(screening) {
   ].filter((line) => line !== null);
 
   download(
-    `referral-${slug(patient)}-${timestampForFilename(timestamp)}.txt`,
+    `screening-note-${slug(patient)}-${timestampForFilename(timestamp)}.txt`,
     'text/plain',
     lines.join('\n'),
   );
