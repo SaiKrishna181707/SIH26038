@@ -15,7 +15,7 @@ from threading import Lock
 from typing import Any
 
 import numpy as np
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 import gradcam
 
@@ -31,10 +31,12 @@ CLASS_NAMES = (
     "Severe DR",
     "Proliferative DR",
 )
+SUPPORTED_IMAGE_FORMATS = {"JPEG", "PNG", "WEBP"}
 # Fundus cameras top out well below this. The limit is checked against the image
 # header before any pixels are decoded, so a decompression bomb is rejected
 # before it can allocate memory.
 MAX_IMAGE_PIXELS = 40_000_000
+PROBABILITY_SUM_TOLERANCE = 1e-3
 
 
 class InvalidImageError(ValueError):
@@ -76,10 +78,19 @@ def preprocess_image(image: Image.Image) -> np.ndarray:
 
 
 def decode_image(image_bytes: bytes) -> Image.Image:
+    """Decode one static JPEG/PNG/WebP and normalize its EXIF orientation."""
     if not image_bytes:
         raise InvalidImageError("The uploaded image is empty.")
     try:
         with Image.open(BytesIO(image_bytes)) as image:
+            actual_format = (image.format or "").upper()
+            if actual_format not in SUPPORTED_IMAGE_FORMATS:
+                raise InvalidImageError(
+                    "The uploaded file is not a supported JPEG, PNG, or WebP image."
+                )
+            if getattr(image, "is_animated", False) or getattr(image, "n_frames", 1) != 1:
+                raise InvalidImageError("Animated images are not supported.")
+
             # Image.open only parses the header, so the size check happens
             # before the pixel buffer is allocated.
             width, height = image.size
@@ -88,15 +99,18 @@ def decode_image(image_bytes: bytes) -> Image.Image:
                     f"The image is too large to process ({width}x{height} pixels)."
                 )
             image.load()
-            return image.copy()
+            # Phone/camera files can store orientation in EXIF rather than in the
+            # pixel matrix. Normalize it before preprocessing and Grad-CAM so the
+            # displayed retina and model input have the same orientation.
+            return ImageOps.exif_transpose(image).copy()
+    except InvalidImageError:
+        raise
     except (
         UnidentifiedImageError,
         Image.DecompressionBombError,
         OSError,
         ValueError,
     ) as exc:
-        if isinstance(exc, InvalidImageError):
-            raise
         raise InvalidImageError("The uploaded file is not a valid image.") from exc
 
 
@@ -115,29 +129,39 @@ def to_numpy(tensor: Any) -> np.ndarray:
 
 
 def normalize_probabilities(raw_output: Any) -> np.ndarray:
-    """Validate and normalise a raw model output into a 1-D probability vector."""
-    probabilities = np.asarray(raw_output, dtype=np.float64).reshape(-1)
-    if probabilities.size != len(CLASS_NAMES):
+    """Validate a single softmax output and absorb only tiny floating-point drift."""
+    array = np.asarray(raw_output, dtype=np.float64)
+    valid_shapes = {(len(CLASS_NAMES),), (1, len(CLASS_NAMES))}
+    if array.shape not in valid_shapes:
         raise RuntimeError(
-            f"Expected {len(CLASS_NAMES)} model outputs, received {probabilities.size}."
+            "Expected one five-class model output with shape "
+            f"(5,) or (1, 5), received {array.shape}."
         )
+
+    probabilities = array.reshape(-1)
     if not np.all(np.isfinite(probabilities)):
         raise RuntimeError("The model returned non-finite probabilities.")
-    # The published model has a softmax output. Normalize defensively to absorb
-    # harmless floating-point drift without hiding malformed negative outputs.
-    if np.any(probabilities < 0) or probabilities.sum() <= 0:
-        raise RuntimeError("The model returned invalid probabilities.")
-    return probabilities / probabilities.sum()
+    if np.any(probabilities < 0.0) or np.any(probabilities > 1.0):
+        raise RuntimeError("The model returned invalid probabilities outside [0, 1].")
+
+    total = float(probabilities.sum())
+    if total <= 0.0 or not np.isclose(
+        total, 1.0, rtol=0.0, atol=PROBABILITY_SUM_TOLERANCE
+    ):
+        raise RuntimeError(
+            f"The model probabilities must sum to 1; received {total:.6f}."
+        )
+    return probabilities / total
 
 
 def split_backbone_and_head(model: Any) -> tuple[Any, tuple[Any, ...]]:
     """Split a model into its convolutional backbone and classifier head.
 
     Grad-CAM's closed form (see :mod:`gradcam`) is only valid for a
-    ``GlobalAveragePooling2D -> Dropout* -> Dense`` head sitting on top of a
-    single nested feature extractor. This validates that shape and raises
-    :class:`ExplanationUnsupportedError` otherwise, so a mismatched
-    architecture disables explanations instead of producing a meaningless map.
+    ``GlobalAveragePooling2D -> Dropout* -> Dense(softmax)`` head sitting on top
+    of a single nested feature extractor. This validates that shape and raises
+    :class:`ExplanationUnsupportedError` otherwise, so a mismatched architecture
+    disables explanations instead of producing a meaningless map.
     """
     import keras
 
@@ -171,17 +195,26 @@ def split_backbone_and_head(model: Any) -> tuple[Any, tuple[Any, ...]]:
         raise ExplanationUnsupportedError(
             f"Unsupported head layers for Grad-CAM: {', '.join(unexpected)}."
         )
-    if not any(isinstance(layer, keras.layers.GlobalAveragePooling2D) for layer in head):
-        raise ExplanationUnsupportedError("The head does not global-average-pool the feature maps.")
+
+    pool_layers = [layer for layer in head if isinstance(layer, keras.layers.GlobalAveragePooling2D)]
+    if len(pool_layers) != 1 or not isinstance(head[0], keras.layers.GlobalAveragePooling2D):
+        raise ExplanationUnsupportedError(
+            "Grad-CAM requires exactly one GlobalAveragePooling2D layer at the start of the head."
+        )
 
     dense_layers = [layer for layer in head if isinstance(layer, keras.layers.Dense)]
     if len(dense_layers) != 1 or not isinstance(head[-1], keras.layers.Dense):
         raise ExplanationUnsupportedError(
             "Grad-CAM requires exactly one Dense layer, and it must be the output layer."
         )
-    if dense_layers[0].units != len(CLASS_NAMES):
+    output_layer = dense_layers[0]
+    if output_layer.units != len(CLASS_NAMES):
         raise ExplanationUnsupportedError(
-            f"Expected a {len(CLASS_NAMES)}-unit output layer, got {dense_layers[0].units}."
+            f"Expected a {len(CLASS_NAMES)}-unit output layer, got {output_layer.units}."
+        )
+    if output_layer.activation is not keras.activations.softmax:
+        raise ExplanationUnsupportedError(
+            "The classifier output must use softmax for the five-class probability contract."
         )
     return backbone, head
 
@@ -210,7 +243,11 @@ class DRModelService:
 
     @property
     def supports_explanations(self) -> bool:
-        return self._class_weights is not None
+        return (
+            self._backbone is not None
+            and bool(self._head_layers)
+            and self._class_weights is not None
+        )
 
     def load(self) -> None:
         if self._model is not None:
@@ -241,7 +278,7 @@ class DRModelService:
             )
 
     def _configure_explanations(self, model: Any) -> None:
-        """Prepare Grad-CAM state, disabling explanations if unsupported."""
+        """Prepare Grad-CAM state, disabling explanations if setup is unsupported."""
         import keras
 
         try:
@@ -250,16 +287,27 @@ class DRModelService:
                 keras.ops.convert_to_numpy(head[-1].kernel), dtype=np.float64
             )
             channels = backbone.output.shape[-1]
-            if class_weights.shape != (channels, len(CLASS_NAMES)):
+            if channels is None or class_weights.shape != (channels, len(CLASS_NAMES)):
                 raise ExplanationUnsupportedError(
                     f"Expected output weights of shape {(channels, len(CLASS_NAMES))}, "
                     f"got {class_weights.shape}."
                 )
+            if not np.all(np.isfinite(class_weights)):
+                raise ExplanationUnsupportedError("The classifier weights contain non-finite values.")
         except ExplanationUnsupportedError as exc:
             logger.warning(
                 "Grad-CAM explanations disabled for this model: %s "
                 "Predictions will still be served.",
                 exc,
+            )
+            self._backbone, self._head_layers, self._class_weights = None, (), None
+            return
+        except Exception:
+            # Explanation setup is deliberately non-critical. A serialization or
+            # backend-specific introspection failure should not make an otherwise
+            # usable classifier unavailable.
+            logger.exception(
+                "Grad-CAM setup failed unexpectedly; predictions will continue without explanations."
             )
             self._backbone, self._head_layers, self._class_weights = None, (), None
             return
