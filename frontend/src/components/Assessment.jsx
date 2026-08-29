@@ -9,6 +9,21 @@ export function Assessment({ screening, classOrder }) {
   const grade = gradeInfo(result.prediction);
   const lowConfidence = isLowConfidence(result.confidence);
   const distribution = orderedProbabilities(result.probabilities, classOrder);
+  const requiresReview = lowConfidence || grade.referral;
+
+  let decisionTitle;
+  let decisionGuidance;
+  if (lowConfidence && !grade.referral) {
+    decisionTitle = 'Manual review required before clearance';
+    decisionGuidance =
+      'The predicted grade is non-referable, but confidence is too low to clear this screening from the AI result alone.';
+  } else if (grade.referral) {
+    decisionTitle = 'Specialist evaluation recommended';
+    decisionGuidance = grade.guidance;
+  } else {
+    decisionTitle = 'No referral indicated by this screening';
+    decisionGuidance = grade.guidance;
+  }
 
   return (
     <>
@@ -64,19 +79,15 @@ export function Assessment({ screening, classOrder }) {
       </Panel>
 
       <Panel title="Clinical decision support" step="REVIEW">
-        <div className={`decision ${grade.referral ? 'refer' : 'clear'}`}>
-          {grade.referral ? (
+        <div className={`decision ${requiresReview ? 'refer' : 'clear'}`}>
+          {requiresReview ? (
             <AlertTriangle size={17} aria-hidden="true" />
           ) : (
             <CheckCircle2 size={17} aria-hidden="true" />
           )}
           <div>
-            <b>
-              {grade.referral
-                ? 'Specialist evaluation recommended'
-                : 'No referral indicated by this screening'}
-            </b>
-            <p>{grade.guidance}</p>
+            <b>{decisionTitle}</b>
+            <p>{decisionGuidance}</p>
           </div>
         </div>
         <button
@@ -84,7 +95,7 @@ export function Assessment({ screening, classOrder }) {
           className="primary wide"
           onClick={() => exportReferralNote(screening)}
         >
-          <FileText size={14} aria-hidden="true" /> Generate referral note
+          <FileText size={14} aria-hidden="true" /> Generate screening note
         </button>
         <div className="safety">
           <ShieldCheck size={13} aria-hidden="true" /> Screening support only · not a diagnosis
