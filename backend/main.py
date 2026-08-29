@@ -110,7 +110,7 @@ class PredictionLoadSheddingMiddleware:
                 declared_bytes = -1
             if declared_bytes > MAX_PREDICT_REQUEST_BYTES:
                 response = JSONResponse(
-                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                    status_code=413,
                     content={
                         "detail": (
                             f"Request exceeds the {MAX_IMAGE_BYTES / (1024 * 1024):g} MB "
@@ -151,7 +151,7 @@ class PredictionLoadSheddingMiddleware:
                     received_bytes += len(message.get("body", b""))
                     if received_bytes > MAX_PREDICT_REQUEST_BYTES:
                         response = JSONResponse(
-                            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                            status_code=413,
                             headers={"Connection": "close"},
                             content={
                                 "detail": (
@@ -245,7 +245,7 @@ def predict(image: UploadFile = File(...)) -> dict[str, object]:
     image_bytes = image.file.read(MAX_IMAGE_BYTES + 1)
     if len(image_bytes) > MAX_IMAGE_BYTES:
         raise HTTPException(
-            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            status_code=413,
             detail=(
                 f"Image exceeds the {MAX_IMAGE_BYTES / (1024 * 1024):g} MB limit."
             ),

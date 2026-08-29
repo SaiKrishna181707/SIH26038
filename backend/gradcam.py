@@ -75,7 +75,7 @@ def upsample_map(cam: np.ndarray, size: tuple[int, int]) -> np.ndarray:
     if len(size) != 2 or size[0] <= 0 or size[1] <= 0:
         raise ValueError(f"Invalid target size {size!r}.")
     # Bicubic interpolation overshoots on sharp edges, so clip afterwards.
-    resized = Image.fromarray(cam.astype(np.float32), mode="F").resize(
+    resized = Image.fromarray(cam.astype(np.float32)).resize(
         size, Image.Resampling.BICUBIC
     )
     return np.clip(np.asarray(resized, dtype=np.float64), 0.0, 1.0)
@@ -98,7 +98,7 @@ def render_overlay(
 
     alpha = (heat * max_alpha)[..., np.newaxis]
     blended = base * (1.0 - alpha) + colors * alpha
-    return Image.fromarray(np.round(blended).astype(np.uint8), mode="RGB")
+    return Image.fromarray(np.round(blended).astype(np.uint8))
 
 
 def encode_data_uri(image: Image.Image) -> str:
