@@ -1,9 +1,8 @@
 # RetinaCare AI — Frontend
 
-React + Vite screening console for SIH26038 (Explainable AI for Diabetic Retinopathy
-Screening in Rural India). It uploads a fundus image to the backend at
-[`../backend`](../backend), then renders the returned grade, class distribution, and
-Grad-CAM overlay.
+React + Vite screening console for SIH26038. It uploads a fundus image to the FastAPI
+backend, validates the returned contract, then renders the grade, probability distribution,
+and Grad-CAM overlay.
 
 ## Run
 
@@ -12,52 +11,62 @@ npm install
 npm run dev
 ```
 
-Opens on http://localhost:5173. Start the backend first (see
-[../backend/README.md](../backend/README.md)) — without it the console loads but shows
-"Service offline" and uploads fail with a message naming the uvicorn command.
+The development server opens on `http://localhost:5173` and proxies `/api/*` to
+`http://localhost:8000/*`.
 
-```bash
-npm run build      # production bundle into dist/
-npm run preview    # serve the built bundle
-```
-
-## Backend wiring
-
-In development, [vite.config.js](vite.config.js) proxies `/api/*` to
-`http://localhost:8000/*`, which keeps the browser on a single origin and sidesteps CORS.
-
-For any other deployment, point the app at the API origin at **build** time — Vite
-inlines `import.meta.env` values into the bundle, so this is not a runtime setting:
+For deployed builds set the API origin at build time:
 
 ```bash
 VITE_API_BASE_URL=https://api.example.com npm run build
 ```
 
-The backend must then list that front-end origin in `CORS_ORIGINS`.
+The backend must allow the frontend origin in `CORS_ORIGINS`.
 
-## Layout
+## Verify
 
-| Path | Role |
-|---|---|
-| `src/api.js` | The only module that performs network calls. Validation, `POST /predict`, `GET /health`, error-message extraction. |
-| `src/severity.js` | Grade → tone, referral flag, guidance text. Confidence formatting and ordering. |
-| `src/report.js` | Client-side JSON export and plain-text referral note. No server round trip. |
-| `src/components/Screening.jsx` | Upload, analyze, cancel. Owns the `AbortController` and the preview object URL. |
-| `src/components/Assessment.jsx` | Grade, probability bars, referral guidance, Grad-CAM overlay. |
-| `src/components/ActivityPage.jsx` | Session metrics and table, derived from real screenings. |
-| `src/App.jsx` | `/health` polling, page routing, session screening list. |
+```bash
+npm test
+npm run build
+```
+
+`npm test` uses Node's built-in test runner, so no additional test framework is required.
+The tests pin response validation and fail-safe confidence/severity behavior. GitHub Actions
+also runs the Vite production build on every pull request.
+
+## Network safety
+
+`src/api.js` is the only module that performs network calls. It enforces:
+
+- client-side JPEG/PNG/WebP and 10 MB checks before upload;
+- a 5-second `/health` timeout and a 120-second `/predict` timeout;
+- safe extraction of FastAPI error details;
+- structural validation of prediction, confidence, probability ranges/sum, and predicted
+  class consistency before any result reaches the UI;
+- `heatmap` restricted to bounded PNG/WebP `data:` URIs.
+
+The backend independently revalidates all image bytes and model output; client checks are
+for fast feedback and UI safety, not security boundaries.
+
+## Fail-safe triage behavior
+
+Confidence below 70% is treated as inconclusive. A low-confidence non-referable class is
+**not** shown as cleared: the decision panel and exported note require manual review before
+triage/clearance. Unknown grades and invalid confidence values also fail safe to review.
 
 ## Session-only state
 
-Nothing is persisted. Patient ID, name, and age stay in React state and are used only in
-the exported referral note — the request body contains the image and nothing else. The
-activity table resets on reload. There is no login and no database; adding either is a
-deployment decision, not a front-end one.
+Patient ID, name, age, and screening history stay in React memory and are not sent to the
+backend; only the image is uploaded. The activity list resets on reload. Exports are
+created entirely in the browser.
 
-## Constraints worth knowing
+## Main modules
 
-- Accepted uploads: JPEG, PNG, WebP, up to 10 MB. Checked client-side *and* server-side.
-- The overlay arrives as a WebP data URI (~30 KB) rather than a second request, which
-  matters on the low-bandwidth connections this project targets.
-- If the backend cannot produce an overlay, `heatmap` is `null` and the explanation panel
-  says so rather than showing a decorative substitute.
+| Path | Role |
+|---|---|
+| `src/api.js` | Network calls, timeouts, upload and response validation. |
+| `src/severity.js` | Grade metadata, fail-safe confidence handling, formatting. |
+| `src/report.js` | Browser-side JSON and screening/review-note exports. |
+| `src/components/Screening.jsx` | Upload/analyze/cancel flow and in-flight request guard. |
+| `src/components/Assessment.jsx` | Probabilities, triage guidance, Grad-CAM display. |
+| `src/components/ActivityPage.jsx` | Session metrics and history table. |
+| `src/App.jsx` | Health polling, navigation, session screening list. |

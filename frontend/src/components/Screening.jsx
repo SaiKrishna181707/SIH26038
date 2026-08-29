@@ -21,6 +21,7 @@ export function Screening({ classOrder, onScreeningComplete }) {
   const [error, setError] = useState('');
   const fileInput = useRef(null);
   const requestRef = useRef(null);
+  const inFlightRef = useRef(false);
   // Held in a ref so the unmount cleanup sees the current URL without making
   // the effect re-run (and revoke a live URL) on every selection.
   const previewRef = useRef('');
@@ -39,6 +40,12 @@ export function Screening({ classOrder, onScreeningComplete }) {
 
   const updatePatient = (key) => (value) => setPatient((prev) => ({ ...prev, [key]: value }));
 
+  const cancelCurrentRequest = () => {
+    requestRef.current?.abort();
+    requestRef.current = null;
+    inFlightRef.current = false;
+  };
+
   const selectImage = useCallback((selected) => {
     if (!selected) return;
     const invalid = validateImage(selected);
@@ -47,6 +54,8 @@ export function Screening({ classOrder, onScreeningComplete }) {
       return;
     }
     requestRef.current?.abort();
+    requestRef.current = null;
+    inFlightRef.current = false;
     setError('');
     setScreening(null);
     setAnalyzing(false);
@@ -58,21 +67,32 @@ export function Screening({ classOrder, onScreeningComplete }) {
   }, []);
 
   const analyze = async () => {
-    if (!file || analyzing) return;
+    // React state updates are asynchronous. The ref closes the tiny window in
+    // which two rapid clicks could both observe analyzing=false and submit two
+    // expensive model requests.
+    if (!file || analyzing || inFlightRef.current) return;
+    inFlightRef.current = true;
+
     const controller = new AbortController();
+    const selectedFile = file;
+    const patientSnapshot = { ...patient };
     requestRef.current = controller;
     setAnalyzing(true);
     setError('');
 
     try {
-      const result = await requestPrediction(file, { signal: controller.signal });
+      const result = await requestPrediction(selectedFile, { signal: controller.signal });
       const record = {
         id:
           globalThis.crypto?.randomUUID?.() ??
           `screening-${performance.now().toString(36)}`,
         timestamp: new Date().toISOString(),
-        patient: { ...patient },
-        image: { name: file.name, sizeBytes: file.size, type: file.type },
+        patient: patientSnapshot,
+        image: {
+          name: selectedFile.name,
+          sizeBytes: selectedFile.size,
+          type: selectedFile.type,
+        },
         result,
       };
       setScreening(record);
@@ -83,16 +103,18 @@ export function Screening({ classOrder, onScreeningComplete }) {
         caught instanceof ApiError ? caught.message : 'Screening failed. Please try again.',
       );
     } finally {
+      // A stale request can finish after the user selected a new image and
+      // started another request. It must not clear the new request's state.
       if (requestRef.current === controller) {
         requestRef.current = null;
+        inFlightRef.current = false;
         setAnalyzing(false);
       }
     }
   };
 
   const clear = () => {
-    requestRef.current?.abort();
-    requestRef.current = null;
+    cancelCurrentRequest();
     setPreviewUrl((previous) => {
       if (previous) URL.revokeObjectURL(previous);
       return '';
@@ -138,7 +160,7 @@ export function Screening({ classOrder, onScreeningComplete }) {
               />
             </div>
             <p className="field-note">
-              Recorded locally for the referral note only. Nothing is sent to the server
+              Recorded locally for the screening note only. Nothing is sent to the server
               except the image itself.
             </p>
           </Panel>

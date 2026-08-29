@@ -18,19 +18,7 @@ Grad-CAM's channel weight is the spatial mean of that gradient, so
 
 The ``1 / (H * W)`` factor is removed by the [0, 1] normalisation below, so
 ``relu(A @ W[:, c])`` is *exactly* Grad-CAM for this architecture -- not an
-approximation of it. Consequences worth knowing:
-
-* only a forward pass is required, so this runs on any Keras backend and adds
-  no measurable cost on top of the prediction that already ran;
-* the maths is plain linear algebra, so it is unit-testable without a model.
-
-The identity holds only for a global-average-pool + single-dense head.
-``model_service`` validates that shape at load time and disables explanations
-rather than emitting a heat map from an architecture this does not describe.
-
-Gradients are taken on the pre-softmax logit, which is standard: backpropagating
-the softmax probability instead mixes in a ``-p_c * sum_k(...)`` term that can
-flip the sign of the map.
+approximation of it.
 """
 
 from __future__ import annotations
@@ -41,49 +29,37 @@ from io import BytesIO
 import numpy as np
 from PIL import Image
 
-# The heat map is intrinsically 7x7, so rendering above the model's 224px input
-# costs nothing and keeps the fundus itself from looking soft when the UI scales
-# the overlay up into a large panel.
 OVERLAY_SIZE = (448, 448)
-# Peak attention reaches this opacity; low-attention areas stay fully transparent
-# so the untouched retina remains readable underneath.
 MAX_ALPHA = 0.55
-# WebP keeps the response near ~30 KB instead of the ~250 KB a PNG of the same
-# overlay costs. This project targets low-bandwidth rural deployments, and the
-# overlay is a visualisation rather than source data, so lossy encoding is fine.
 WEBP_QUALITY = 85
 
 
 def class_activation_map(features: np.ndarray, class_weights: np.ndarray) -> np.ndarray:
-    """Return the normalised Grad-CAM map for one image.
-
-    Args:
-        features: final feature maps, shape ``(H, W, K)``.
-        class_weights: dense weights for the target class, shape ``(K,)``.
-
-    Returns:
-        Array of shape ``(H, W)`` scaled to [0, 1]. An all-zero map is returned
-        when no position carries positive evidence, which is degenerate but not
-        an error.
-    """
+    """Return the normalised Grad-CAM map for one image."""
     if features.ndim != 3:
         raise ValueError(f"Expected feature maps with shape (H, W, K), got {features.shape}.")
     if class_weights.ndim != 1 or class_weights.shape[0] != features.shape[-1]:
         raise ValueError(
             f"Expected {features.shape[-1]} class weights, got shape {class_weights.shape}."
         )
+    if not np.all(np.isfinite(features)):
+        raise ValueError("Feature maps contain non-finite values.")
+    if not np.all(np.isfinite(class_weights)):
+        raise ValueError("Class weights contain non-finite values.")
 
     cam = np.tensordot(features, class_weights, axes=([2], [0])).astype(np.float64)
     np.maximum(cam, 0.0, out=cam)
 
-    peak = cam.max()
-    if not np.isfinite(peak) or peak <= 0.0:
+    peak = float(cam.max())
+    if peak <= 0.0:
         return np.zeros(cam.shape, dtype=np.float64)
     return cam / peak
 
 
 def jet_colors(values: np.ndarray) -> np.ndarray:
     """Map values in [0, 1] to the conventional Grad-CAM 'jet' ramp as uint8 RGB."""
+    if not np.all(np.isfinite(values)):
+        raise ValueError("Heat-map values contain non-finite values.")
     scaled = np.clip(values, 0.0, 1.0) * 4.0
     red = np.clip(1.5 - np.abs(scaled - 3.0), 0.0, 1.0)
     green = np.clip(1.5 - np.abs(scaled - 2.0), 0.0, 1.0)
@@ -94,8 +70,12 @@ def jet_colors(values: np.ndarray) -> np.ndarray:
 
 def upsample_map(cam: np.ndarray, size: tuple[int, int]) -> np.ndarray:
     """Smoothly resize a small CAM to ``size`` (width, height), clipped to [0, 1]."""
+    if cam.ndim != 2 or not np.all(np.isfinite(cam)):
+        raise ValueError("Expected a finite two-dimensional heat map.")
+    if len(size) != 2 or size[0] <= 0 or size[1] <= 0:
+        raise ValueError(f"Invalid target size {size!r}.")
     # Bicubic interpolation overshoots on sharp edges, so clip afterwards.
-    resized = Image.fromarray(cam.astype(np.float32), mode="F").resize(
+    resized = Image.fromarray(cam.astype(np.float32)).resize(
         size, Image.Resampling.BICUBIC
     )
     return np.clip(np.asarray(resized, dtype=np.float64), 0.0, 1.0)
@@ -108,6 +88,8 @@ def render_overlay(
     max_alpha: float = MAX_ALPHA,
 ) -> Image.Image:
     """Blend a CAM over ``image`` with opacity proportional to attention."""
+    if not 0.0 <= max_alpha <= 1.0:
+        raise ValueError("max_alpha must be between 0 and 1.")
     base = np.asarray(
         image.convert("RGB").resize(size, Image.Resampling.LANCZOS), dtype=np.float64
     )
@@ -116,7 +98,7 @@ def render_overlay(
 
     alpha = (heat * max_alpha)[..., np.newaxis]
     blended = base * (1.0 - alpha) + colors * alpha
-    return Image.fromarray(np.round(blended).astype(np.uint8), mode="RGB")
+    return Image.fromarray(np.round(blended).astype(np.uint8))
 
 
 def encode_data_uri(image: Image.Image) -> str:
@@ -129,7 +111,6 @@ def encode_data_uri(image: Image.Image) -> str:
             else:
                 image.save(buffer, format=image_format, optimize=True)
         except (OSError, KeyError, ValueError):
-            # Pillow can be built without WebP support; fall through to PNG.
             continue
         encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
         return f"data:{mime};base64,{encoded}"
