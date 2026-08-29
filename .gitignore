@@ -1,3 +1,4 @@
+# Python
 backend/.venv/
 backend/__pycache__/
 backend/.pytest_cache/
@@ -7,3 +8,12 @@ backend/**/*.py[cod]
 backend/.env
 backend/artifacts/
 
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
