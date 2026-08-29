@@ -1,25 +1,24 @@
 # SIH26038 AI Backend
 
 FastAPI service and prediction CLI for five-class diabetic-retinopathy grading with the
-pretrained [`Aldahmashi/DR-EfficientNetB0`](https://huggingface.co/Aldahmashi/DR-EfficientNetB0)
-Keras model on the PyTorch backend, plus a Grad-CAM overlay for each prediction.
+pretrained `Aldahmashi/DR-EfficientNetB0` Keras model on the PyTorch backend, plus a
+Grad-CAM overlay for each prediction.
 
 > **Prototype limitation:** this model is not clinically validated and must not be used
-> for diagnosis or patient-care decisions. `/health` reports `clinical_use: false` for
-> exactly this reason.
+> for diagnosis or patient-care decisions. `/health` reports `clinical_use: false`.
 
 ## Setup
 
 ```bash
-python -m venv .venv && .venv/Scripts/activate && python -m pip install -r requirements-dev.txt
+python -m venv .venv
+# Windows: .venv/Scripts/activate
+# Linux/macOS: source .venv/bin/activate
+python -m pip install -r requirements-dev.txt
 ```
 
-On Linux/macOS the activate path is `.venv/bin/activate`. Python 3.11 or 3.12 is the
-safe choice — the pinned `torch==2.8.0` has no wheel for every 3.13 platform, and none at
-all for Windows on ARM64.
-
-The model lives at `models/final_model.keras`. If that file is absent the first
-prediction downloads it from Hugging Face. Set `MODEL_PATH` to use another local copy.
+Python 3.11 or 3.12 is the safest choice for the pinned ML stack. The committed model is
+`models/final_model.keras`; set `MODEL_PATH` to use another local copy. If the configured
+file does not exist, Keras falls back to `hf://Aldahmashi/DR-EfficientNetB0`.
 
 ## Run the API
 
@@ -27,11 +26,10 @@ prediction downloads it from Hugging Face. Set `MODEL_PATH` to use another local
 python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Interactive docs at `http://localhost:8000/docs`.
+Interactive docs: `http://localhost:8000/docs`.
 
-The model loads on a background thread at startup, so the server binds immediately and
-the first request is not the slow one. A failed load does not stop the boot: `/health`
-reports `model_loaded: false` and `/predict` retries the load per request.
+The model warms on a background thread. A failed warm-up does not prevent boot;
+`/health` remains available and `/predict` retries model loading.
 
 ### `GET /health`
 
@@ -42,16 +40,16 @@ reports `model_loaded: false` and `/predict` retries the load per request.
   "model_loaded": true,
   "explanations_available": true,
   "classes": ["No DR", "Mild DR", "Moderate DR", "Severe DR", "Proliferative DR"],
-  "clinical_use": false
+  "clinical_use": false,
+  "max_concurrent_predictions": 2
 }
 ```
 
-The front end polls this to drive its status indicators, and uses `classes` to order the
-probability bars.
-
 ### `POST /predict`
 
-`multipart/form-data`, field name exactly `image`. JPEG, PNG, or WebP up to 10 MB.
+`multipart/form-data`, field name exactly `image`. The declared MIME type and the actual
+file must both resolve to a **static JPEG, PNG, or WebP**. Default image limit: 10 MB.
+EXIF orientation is normalized before inference.
 
 ```json
 {
@@ -68,103 +66,74 @@ probability bars.
 }
 ```
 
-`heatmap` is a 448×448 Grad-CAM overlay as a data URI — inlined rather than fetched
-separately, because a second round trip is expensive on the connections this project
-targets. It is `null` when the loaded architecture does not support explanations or when
-overlay generation fails; a prediction is still returned in both cases.
+`heatmap` is a 448×448 Grad-CAM overlay data URI. It is `null` if explanation setup or
+rendering is unavailable; prediction still succeeds.
 
-Failure modes: `415` wrong content type, `413` over the byte limit, `422` undecodable or
-oversized image, `503` inference failure (details are logged, not returned).
+Failure modes: `415` wrong declared content type, `413` request/image too large, `422`
+invalid/unsupported/animated image, `429` prediction capacity full, `503` model/inference
+failure. Internal exception details are logged, not returned.
+
+## Load protection
+
+The model service serializes inference because the backend/model combination is not
+assumed to be safe under parallel prediction. The HTTP layer additionally limits how many
+`/predict` requests may be active/queued before multipart parsing. Excess requests get
+`429 Too Many Requests` and `Retry-After: 1`; `/health` is not subject to this gate.
+
+The request-size ceiling is enforced twice: obvious oversized `Content-Length` values are
+rejected immediately, and streamed/chunked bodies are counted before Starlette parses the
+multipart payload. This prevents an attacker from bypassing the ceiling by omitting
+`Content-Length`.
 
 ## Grad-CAM
 
-`gradcam.py` needs no autograd, no GPU, and no ML framework — only numpy and Pillow.
-
-The head of this network is `GlobalAveragePooling2D → Dropout → Dense(5)`, so for feature
-map `A_k` of size H×W and class weight `W_kc`:
+The classifier head is `GlobalAveragePooling2D → Dropout* → Dense(5, softmax)`. For final
+feature maps `A` and dense class weights `W`, Grad-CAM reduces exactly to:
 
 ```
-logit_c = Σ_k W_kc · mean(A_k) + b_c      ⇒      ∂logit_c/∂A_kij = W_kc / (H·W)
+cam = relu(A @ W[:, class])
 ```
 
-The gradient is spatially constant, so Grad-CAM's spatial average of gradients is
-`α_kc = W_kc/(H·W)`, and after the standard `[0,1]` normalisation the `1/(H·W)` factor
-cancels:
+up to a positive spatial constant removed by `[0,1]` normalization. `model_service.py`
+validates that runtime architecture before enabling explanations. Non-finite features or
+weights are rejected and explanation failure degrades to `heatmap: null`.
 
-```
-cam = relu(Σ_k W_kc · A_k)
-```
+## Preprocessing and output contract
 
-That is not an approximation of Grad-CAM for this architecture — it is Grad-CAM, in
-closed form. `tests/test_gradcam.py` verifies it against finite-difference numerical
-gradients of the logit rather than taking the derivation on trust.
-
-Two consequences worth stating: the weights come from the **pre-softmax logit** (softmax
-gradients add a `−p_c·Σ` term that can flip the sign), and the map is intrinsically 7×7
-because that is EfficientNetB0's final spatial resolution at 224×224 input. Upsampling to
-448 makes it legible, not more precise.
-
-`model_service.py` validates the architecture at load time. If the head is not a single
-trailing `Dense` over a `GlobalAveragePooling2D`, it logs a warning, sets
-`explanations_available: false`, and keeps serving predictions.
-
-## Preprocessing
-
-Feed **raw 0–255 float32**. The saved model normalises internally — its first layers are
-`Rescaling(1/255) → Normalization(ImageNet stats) → Rescaling`. Dividing by 255 before
-calling it applies the scaling twice and silently degrades accuracy.
-`tests/test_real_model.py` asserts those layers are present, so this assumption fails
-loudly if the weights are ever swapped for a model that expects normalised input.
+The saved EfficientNet model normalizes internally, so preprocessing feeds raw `0..255`
+`float32` RGB pixels resized to 224×224. The output must be exactly one five-class softmax
+vector with shape `(5,)` or `(1, 5)`, finite values in `[0,1]`, and a sum within `1e-3` of
+`1`. Invalid model output fails closed instead of being reshaped/renormalized into a
+plausible answer.
 
 ## Local prediction
 
 ```bash
 python predict.py path/to/retinal-image.jpg
-```
-
-```bash
 python predict.py path/to/retinal-image.jpg --heatmap overlay.webp
 ```
-
-Prints the class, confidence, and all five probabilities; `--heatmap` also writes the
-decoded overlay. Exit codes: `0` success, `1` bad image, `2` inference failure.
 
 ## Configuration
 
 | Variable | Default | Effect |
-|---|---|---|
-| `MODEL_PATH` | `models/final_model.keras` | Local weights to load instead of downloading. |
-| `MAX_IMAGE_BYTES` | `10485760` | Upload size ceiling. |
-| `CORS_ORIGINS` | `http://localhost:3000,http://localhost:5173` | Comma-separated allowed front-end origins. |
-| `WARMUP_ON_STARTUP` | `1` | Set `0` to skip the background load (useful in tests). |
+|---|---:|---|
+| `MODEL_PATH` | `models/final_model.keras` | Local weights path. |
+| `MAX_IMAGE_BYTES` | `10485760` | Image byte ceiling. Invalid/non-positive values fall back safely. |
+| `MAX_CONCURRENT_PREDICTIONS` | `2` | Active/queued `/predict` admission limit. |
+| `MAX_MULTIPART_OVERHEAD_BYTES` | `524288` | Multipart framing allowance above the image limit. |
+| `CORS_ORIGINS` | `http://localhost:3000,http://localhost:5173` | Comma-separated allowed frontend origins. |
+| `WARMUP_ON_STARTUP` | `1` | Set `0` to skip background model warm-up. |
 | `LOG_LEVEL` | `INFO` | Root log level. |
-| `KERAS_BACKEND` | `torch` | Set before any Keras import; override only if you have a different backend installed. |
-
-In production, set `CORS_ORIGINS` to the real front-end origin:
-
-```bash
-CORS_ORIGINS=https://frontend.example.com python -m uvicorn main:app --host 0.0.0.0 --port 8000
-```
+| `KERAS_BACKEND` | `torch` | Keras backend selected before import. |
 
 ## Verification
 
 ```bash
 python -m pytest -q
-```
-
-`conftest.py` puts this directory on `sys.path`, so a bare `pytest` from the repo root
-works too.
-
-Most of the suite runs without a Keras backend at all — the ML imports are lazy and the
-tests substitute fakes, so Grad-CAM maths, the API contract, image validation, and error
-paths are all covered on any machine.
-
-`tests/test_real_model.py` is the exception: it loads the actual weights and executes the
-network. It skips cleanly when Keras or the weights are missing, so **run it at least
-once on the machine you will demo from** — it is what proves that the manual head applied
-in `_forward` is numerically identical to `model.predict`, and that the real overlay is
-non-uniform.
-
-```bash
 python -m pytest tests/test_real_model.py -v
 ```
+
+Most tests run without loading Keras. `test_real_model.py` executes the committed network,
+checks the preprocessing/architecture assumptions, confirms manual-head predictions match
+`model.predict`, and verifies the overlay is decodable and non-uniform. GitHub Actions
+installs the full pinned ML stack on Linux x64 so this test runs on every pull request.

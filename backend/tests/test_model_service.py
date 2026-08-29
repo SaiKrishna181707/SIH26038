@@ -76,10 +76,10 @@ def explainable_service(seed=0, peak_channel=2, peak_position=(1, 5)):
     features[0, peak_position[0], peak_position[1], peak_channel] = 9.0
 
     kernel = np.full((FEATURE_SHAPE[-1], len(CLASS_NAMES)), -0.1)
-    kernel[peak_channel, 2] = 1.0  # channel drives the "Moderate DR" class
+    kernel[peak_channel, 2] = 1.0
 
     service = DRModelService()
-    service._model = object()  # non-None so load() short-circuits
+    service._model = object()
     service._backbone = FakeBackbone(features)
     service._head_layers = (FakePool(), FakeDense(kernel, np.zeros(len(CLASS_NAMES))))
     service._class_weights = kernel
@@ -103,11 +103,7 @@ def test_preprocess_produces_expected_shape_and_type():
 
 
 def test_preprocess_does_not_rescale_pixels():
-    """The model normalises internally, so values must stay in 0-255 here.
-
-    Rescaling in preprocessing would apply normalisation twice and quietly
-    destroy accuracy, which is why this is pinned by a test.
-    """
+    """The model normalises internally, so values must stay in 0-255 here."""
     batch = preprocess_image(Image.new("RGB", (10, 10), (255, 255, 255)))
 
     assert batch.max() == pytest.approx(255.0)
@@ -147,8 +143,10 @@ def test_supported_formats_decode():
 # --- probability validation ------------------------------------------------
 
 
-def test_probabilities_are_renormalised():
-    normalised = normalize_probabilities(np.array([[0.1, 0.2, 0.3, 0.2, 0.1]]))
+def test_probabilities_with_tiny_float_drift_are_renormalised():
+    normalised = normalize_probabilities(
+        np.array([[0.1999, 0.2, 0.2, 0.2, 0.2]])
+    )
 
     assert normalised.sum() == pytest.approx(1.0)
     assert normalised.shape == (len(CLASS_NAMES),)
@@ -157,10 +155,13 @@ def test_probabilities_are_renormalised():
 @pytest.mark.parametrize(
     "raw, message",
     [
-        (np.ones((1, 3)), "Expected 5 model outputs"),
+        (np.ones((1, 3)), "one five-class model output"),
+        (np.ones((5, 1)) / 5, "one five-class model output"),
         (np.array([[0.5, 0.5, np.nan, 0.0, 0.0]]), "non-finite"),
-        (np.array([[-0.5, 0.5, 0.5, 0.5, 0.0]]), "invalid probabilities"),
-        (np.zeros((1, 5)), "invalid probabilities"),
+        (np.array([[-0.5, 0.5, 0.5, 0.5, 0.0]]), "outside"),
+        (np.array([[1.1, 0.0, 0.0, 0.0, 0.0]]), "outside"),
+        (np.zeros((1, 5)), "sum to 1"),
+        (np.ones((1, 5)), "sum to 1"),
     ],
 )
 def test_malformed_model_output_is_rejected(raw, message):
@@ -202,7 +203,6 @@ def test_explanation_can_be_skipped():
 
 
 def test_backbone_runs_once_per_prediction():
-    """Grad-CAM must reuse the prediction's forward pass, not add another."""
     service = explainable_service()
     service.predict_bytes(image_bytes())
 
@@ -210,16 +210,14 @@ def test_backbone_runs_once_per_prediction():
 
 
 def test_heatmap_is_hottest_where_the_driving_channel_peaks():
-    """A synthetic activation in one corner must surface in that corner."""
     from base64 import b64decode
 
-    service = explainable_service(peak_position=(0, 6))  # top-right of the 7x7 grid
+    service = explainable_service(peak_position=(0, 6))
     heatmap = service.predict_bytes(image_bytes()).heatmap
     overlay = np.asarray(
         Image.open(BytesIO(b64decode(heatmap.partition(",")[2]))).convert("RGB"),
         dtype=np.float64,
     )
-    # Redness relative to blue marks the hot area of the jet ramp.
     heat = overlay[..., 0] - overlay[..., 2]
     row, col = np.unravel_index(int(np.argmax(heat)), heat.shape)
     height, width = heat.shape
@@ -240,7 +238,6 @@ def test_service_without_explanation_support_falls_back_to_predict():
 
 
 def test_heatmap_failure_degrades_to_a_prediction(monkeypatch):
-    """A broken overlay must not turn a usable prediction into an error."""
     def explode(*_args, **_kwargs):
         raise RuntimeError("overlay backend unavailable")
 
@@ -259,7 +256,9 @@ def test_predict_file_reads_from_disk(tmp_path):
 
 
 def test_as_dict_exposes_the_api_contract():
-    payload = Prediction("No DR", 0.9, {"No DR": 0.9}, heatmap="data:image/webp;base64,AA").as_dict()
+    payload = Prediction(
+        "No DR", 0.9, {"No DR": 0.9}, heatmap="data:image/webp;base64,AA"
+    ).as_dict()
 
     assert set(payload) == {"prediction", "confidence", "probabilities", "heatmap"}
 

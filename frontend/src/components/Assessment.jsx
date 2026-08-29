@@ -9,6 +9,25 @@ export function Assessment({ screening, classOrder }) {
   const grade = gradeInfo(result.prediction);
   const lowConfidence = isLowConfidence(result.confidence);
   const distribution = orderedProbabilities(result.probabilities, classOrder);
+  const requiresReview = lowConfidence || grade.referral;
+
+  let decisionTitle;
+  let decisionGuidance;
+  if (lowConfidence && !grade.referral) {
+    decisionTitle = 'Manual review required before clearance';
+    decisionGuidance =
+      'The predicted grade is non-referable, but confidence is too low to clear this screening from the AI result alone.';
+  } else if (lowConfidence && grade.referral) {
+    decisionTitle = 'Specialist evaluation and manual review recommended';
+    decisionGuidance =
+      'The predicted grade is referable and confidence is low. Prioritize specialist evaluation and manually verify the image.';
+  } else if (grade.referral) {
+    decisionTitle = 'Specialist evaluation recommended';
+    decisionGuidance = grade.guidance;
+  } else {
+    decisionTitle = 'No referral indicated by this screening';
+    decisionGuidance = grade.guidance;
+  }
 
   return (
     <>
@@ -31,7 +50,7 @@ export function Assessment({ screening, classOrder }) {
             </strong>
           </div>
           <div className="score">
-            <b>{Math.round(result.confidence * 100)}</b>
+            <b>{Number.isFinite(result.confidence) ? Math.round(result.confidence * 100) : '—'}</b>
             <span>CONF.</span>
           </div>
         </div>
@@ -57,26 +76,29 @@ export function Assessment({ screening, classOrder }) {
               <b>{formatPercent(value)}</b>
             </div>
             <i>
-              <u style={{ width: `${Math.max(value * 100, 0.5)}%` }} />
+              <u
+                style={{
+                  width: `${Math.min(
+                    Math.max(Number.isFinite(value) ? value * 100 : 0, 0.5),
+                    100,
+                  )}%`,
+                }}
+              />
             </i>
           </div>
         ))}
       </Panel>
 
       <Panel title="Clinical decision support" step="REVIEW">
-        <div className={`decision ${grade.referral ? 'refer' : 'clear'}`}>
-          {grade.referral ? (
+        <div className={`decision ${requiresReview ? 'refer' : 'clear'}`}>
+          {requiresReview ? (
             <AlertTriangle size={17} aria-hidden="true" />
           ) : (
             <CheckCircle2 size={17} aria-hidden="true" />
           )}
           <div>
-            <b>
-              {grade.referral
-                ? 'Specialist evaluation recommended'
-                : 'No referral indicated by this screening'}
-            </b>
-            <p>{grade.guidance}</p>
+            <b>{decisionTitle}</b>
+            <p>{decisionGuidance}</p>
           </div>
         </div>
         <button
@@ -84,7 +106,8 @@ export function Assessment({ screening, classOrder }) {
           className="primary wide"
           onClick={() => exportReferralNote(screening)}
         >
-          <FileText size={14} aria-hidden="true" /> Generate referral note
+          <FileText size={14} aria-hidden="true" />{' '}
+          {requiresReview ? 'Generate review / referral note' : 'Generate screening note'}
         </button>
         <div className="safety">
           <ShieldCheck size={13} aria-hidden="true" /> Screening support only · not a diagnosis

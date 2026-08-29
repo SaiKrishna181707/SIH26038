@@ -48,13 +48,20 @@ top-bar pill reflect those fields rather than hard-coded text.
 cd backend && python -m pytest -q
 ```
 
-55 tests. One (`tests/test_real_model.py`) is skipped unless a Keras backend and the
-model weights are both present — it is the suite that actually executes the network, so
-run it at least once on the demo machine.
+The backend suite covers the HTTP contract, image decoding, probability validation,
+Grad-CAM maths/rendering, overload handling, malformed/chunked uploads, and the real
+model integration test when Keras and the committed weights are available.
 
 ```bash
-cd frontend && npm run build
+cd frontend && npm test && npm run build
 ```
+
+The frontend tests pin the network-response contract and fail-safe confidence/severity
+rules. GitHub Actions runs both backend and frontend jobs on every pull request and on
+pushes to `main`; the backend CI installs the full ML stack so `test_real_model.py`
+executes against `models/final_model.keras` on Linux x64.
+
+See [STRESS_TEST_REPORT.md](STRESS_TEST_REPORT.md) for the hardening scenarios and fixes.
 
 ## What the model can and cannot do
 

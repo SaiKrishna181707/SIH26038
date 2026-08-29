@@ -1,7 +1,4 @@
 // Presentation rules for the five grades the backend can return.
-//
-// Wording is deliberately conservative: this is screening triage support, and
-// every surface that shows it also shows the not-a-diagnosis notice.
 
 export const CLASS_ORDER = [
   'No DR',
@@ -11,8 +8,6 @@ export const CLASS_ORDER = [
   'Proliferative DR',
 ];
 
-// Below this the grade is treated as inconclusive and flagged for manual review
-// rather than presented as a confident answer.
 export const LOW_CONFIDENCE_THRESHOLD = 0.7;
 
 const GRADES = {
@@ -56,27 +51,30 @@ const UNKNOWN_GRADE = {
 };
 
 export function gradeInfo(prediction) {
+  if (typeof prediction !== 'string' || !prediction.trim()) return { ...UNKNOWN_GRADE };
   return GRADES[prediction] ?? { ...UNKNOWN_GRADE, shortLabel: prediction };
 }
 
+/** Invalid/missing confidence is treated conservatively as requiring review. */
 export function isLowConfidence(confidence) {
-  return typeof confidence === 'number' && confidence < LOW_CONFIDENCE_THRESHOLD;
+  return !Number.isFinite(confidence) || confidence < LOW_CONFIDENCE_THRESHOLD || confidence > 1;
 }
 
 export function formatPercent(value, digits = 1) {
+  if (!Number.isFinite(value)) return '—';
   return `${(value * 100).toFixed(digits)}%`;
 }
 
-/**
- * Order the probability map for display.
- *
- * Prefers the class order reported by /health so the backend stays the single
- * source of truth, falls back to the built-in order, and appends any class the
- * frontend does not know about rather than silently dropping it.
- */
 export function orderedProbabilities(probabilities, classOrder) {
-  const preferred = classOrder?.length ? classOrder : CLASS_ORDER;
-  const known = preferred.filter((name) => name in probabilities);
-  const extra = Object.keys(probabilities).filter((name) => !preferred.includes(name));
-  return [...known, ...extra].map((name) => [name, probabilities[name]]);
+  const safeProbabilities =
+    probabilities && typeof probabilities === 'object' && !Array.isArray(probabilities)
+      ? probabilities
+      : {};
+  const preferred =
+    Array.isArray(classOrder) && classOrder.every((name) => typeof name === 'string')
+      ? classOrder
+      : CLASS_ORDER;
+  const known = preferred.filter((name) => Object.hasOwn(safeProbabilities, name));
+  const extra = Object.keys(safeProbabilities).filter((name) => !preferred.includes(name));
+  return [...known, ...extra].map((name) => [name, safeProbabilities[name]]);
 }
